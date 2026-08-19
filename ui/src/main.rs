@@ -1,7 +1,6 @@
 #![warn(clippy::all, rust_2018_idioms)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
-// When compiling natively:
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
@@ -13,7 +12,7 @@ fn main() -> eframe::Result {
             .with_icon(
                 // NOTE: Adding an icon is optional
                 eframe::icon_data::from_png_bytes(
-                    &include_bytes!("../assets/favicon-512x512.png")[..],
+                    &include_bytes!("assets/favicon-512x512.png")[..],
                 )
                 .expect("Failed to load icon"),
             ),
@@ -22,7 +21,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "eframe template",
         native_options,
-        Box::new(|cc| Ok(Box::new(eframe_template::TemplateApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(event_camera_edit_proto::TemplateApp::new(cc)))),
     )
 }
 
@@ -52,7 +51,11 @@ fn main() {
             .start(
                 canvas,
                 web_options,
-                Box::new(|cc| Ok(Box::new(eframe_template::TemplateApp::new(cc)))),
+                Box::new(|cc| {
+                    Ok(Box::new(event_camera_edit_proto_desktop::TemplateApp::new(
+                        cc,
+                    )))
+                }),
             )
             .await;
 
