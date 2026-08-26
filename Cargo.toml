@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = [
+members = ["crates/io",
     "ui",
     #"crates/core",
 ]
@@ -40,6 +40,7 @@ unsafe_op_in_unsafe_fn = "warn" # `unsafe_op_in_unsafe_fn` may become the defaul
 unused_extern_crates = "warn"
 unused_import_braces = "warn"
 unused_lifetimes = "warn"
+unwrap_used = "warn"
 
 trivial_casts = "allow"
 unused_qualifications = "allow"
