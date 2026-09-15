@@ -1,12 +1,14 @@
-use std::pin::Pin;
-
 use async_trait::async_trait;
+use std::{pin::Pin, str::FromStr};
 use tokio::io::AsyncRead;
 
 use crate::{
+    aedat4_header_generated::CompressionType,
     error::{DecodeError, FileReadError},
+    event,
     file::FileFormat,
-    frame::Frame,
+    frame::{self, Frame},
+    imu, trigger,
 };
 
 /// (asyncronous) source of bytes, e.g. a file, network stream etc.
@@ -36,13 +38,85 @@ pub trait Decoder {
     fn metadata(&self) -> &VideoMetadata;
 
     /// Decode the next frame.
-    async fn next_frame(&mut self) -> Result<Option<Frame>, DecodeError>;
+    async fn next_packet(&mut self) -> Result<Option<Packet>, DecodeError>;
 
     /// Decode all frames and return them as a vector. Very slow!!!
-    async fn all_frames(&mut self) -> Result<Vec<Frame>, DecodeError>;
+    async fn all_frames(&mut self) -> Result<Vec<Packet>, DecodeError>;
 }
 
 //pub trait Encoder {}
 
-#[derive(Debug)]
-pub struct VideoMetadata {} // TODO: figure out what we need
+impl FromStr for CompressionType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" => Ok(CompressionType::NONE),
+            "lz4" => Ok(CompressionType::LZ4),
+            "lz4_high" => Ok(CompressionType::LZ4_HIGH),
+            "zstd" => Ok(CompressionType::ZSTD),
+            "zstd_high" => Ok(CompressionType::ZSTD_HIGH),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoMetadata {
+    // A vector containing information about the output modules
+    pub output_modules: Vec<ModuleInfo>,
+    /// The compression type used for all streams
+    pub compression: CompressionType,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutputInfo {
+    /// The width of the output in pixels (if applicable)
+    pub size_x: Option<u32>,
+    /// The height of the output in pixels (if applicable)
+    pub size_y: Option<u32>,
+    /// The source of the output, e.g. a specific camera name: DAVIS346_00000002
+    pub source: Option<String>,
+    /// The timestamp offset of the output
+    pub ts_offset: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+/// Information about the module that generated this output e.g. a module which records events
+pub struct ModuleInfo {
+    /// Name of the output produced by the module, e.g events, IMU, frames
+    pub output_name: String,
+    /// Description of the module, e.g. "a standard 8-bit image"
+    pub description: String,
+    /// Metadata about the output, e.g. compression type, dimensions
+    pub output_info: OutputInfo,
+}
+
+impl Default for ModuleInfo {
+    fn default() -> Self {
+        Self {
+            description: String::new(),
+            output_name: String::new(),
+            output_info: OutputInfo {
+                size_x: None,
+                size_y: None,
+                source: None,
+                ts_offset: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PacketContent {
+    pub id: i32,
+    pub buffer: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Packet {
+    EventPacket(PacketContent),
+    FramePacket(PacketContent),
+    ImuPacket(PacketContent),
+    TriggerPacket(PacketContent),
+}

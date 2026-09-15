@@ -1,4 +1,4 @@
-use std::{io::ErrorKind, path};
+use std::io::{ErrorKind, Read};
 
 use async_trait::async_trait;
 ///
@@ -6,21 +6,24 @@ use async_trait::async_trait;
 ///
 use tokio::io::{self, AsyncReadExt, BufReader};
 
-#[path = "../generated/aedat4_header_generated.rs"]
-#[allow(unsafe_code)]
-mod aedat4_header_generated;
-use aedat4_header_generated::*;
+use xml::{
+    attribute::OwnedAttribute,
+    reader::{EventReader, XmlEvent},
+};
 
-#[path = "../generated/aedat4_data_generated.rs"]
-#[allow(unsafe_code)]
-mod aedat4_data_generated;
-use aedat4_data_generated::*;
+use std::io::Cursor;
+
+use lz4;
 
 use crate::{
-    codec::{ByteSource, Codec, Decoder, DecoderFactory, VideoMetadata},
+    aedat4_data_generated,
+    aedat4_header_generated::{self, CompressionType},
+    codec::{
+        ByteSource, Codec, Decoder, DecoderFactory, ModuleInfo, OutputInfo, Packet, PacketContent,
+        VideoMetadata,
+    },
     error::{DecodeError, FileReadError},
     file::{AEDAT4_FORMAT, FileFormat},
-    frame::Frame,
 };
 
 /// Struct representing the state of AEDAT4 codec.
@@ -45,6 +48,14 @@ async fn read_exact_and_handle_err(
         Ok(_) => Ok(()),
         Err(err) => Err(err),
     };
+}
+
+fn is_root_output_node(attrs: Vec<OwnedAttribute>) -> bool {
+    attrs.iter().any(|a| {
+        a.name.local_name == "path"
+            && a.value.starts_with("/mainloop/Recorder/outInfo")
+            && !a.value.ends_with("info/")
+    })
 }
 
 impl Codec for Aedat4 {
@@ -91,14 +102,92 @@ impl DecoderFactory for Aedat4 {
                 )
             })?;
 
-        println!("iohe_root: {:?}", iohe_root);
+        // extract metadata from xml in iohe_root
+        // the xml contains a "outinfo" section, with numbered modules, from 0...n
+
+        let mut module_vector: Vec<ModuleInfo> = vec![];
+        let mut current_module = ModuleInfo::default();
+        let mut current_attr: Option<String> = None;
+
+        let metadata = match iohe_root.info() {
+            Some(info) => {
+                let parser = EventReader::new(info.as_bytes());
+                for e in parser {
+                    match e {
+                        Ok(XmlEvent::StartElement {
+                            name, attributes, ..
+                        }) => {
+                            match name.local_name.as_str() {
+                                "dv" => {}
+                                "node" => {
+                                    if is_root_output_node(attributes) && current_attr.is_some() {
+                                        // finished parsing the module
+                                        module_vector.push(current_module);
+                                        current_module = ModuleInfo::default();
+                                        current_attr = None;
+                                    }
+                                }
+                                "attr" => {
+                                    for attr in attributes {
+                                        if attr.name.local_name == "key" {
+                                            current_attr = Some(attr.value.clone());
+                                        }
+                                    }
+                                }
+                                unknown_tag => {
+                                    eprintln!(
+                                        "found unexpected tag: {} in xml metadata",
+                                        unknown_tag
+                                    );
+                                }
+                            }
+                        }
+                        Ok(XmlEvent::Characters(s)) => {
+                            if let Some(attr) = current_attr.as_deref() {
+                                match attr {
+                                    "typeIdentifier" => {
+                                        current_module.output_name = s;
+                                    }
+                                    "sizeX" => {
+                                        current_module.output_info.size_x = s.parse().ok();
+                                    }
+                                    "sizeY" => {
+                                        current_module.output_info.size_y = s.parse().ok();
+                                    }
+                                    "source" => {
+                                        current_module.output_info.source = Some(s.clone());
+                                    }
+                                    "tsOffset" => {
+                                        current_module.output_info.ts_offset = s.parse().ok();
+                                    }
+                                    "typeDescription" => {
+                                        current_module.description = s.clone();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Err(_) => {}
+                        _ => {}
+                    }
+                }
+                let compression = iohe_root.compression();
+                Some(VideoMetadata {
+                    output_modules: module_vector,
+                    compression: compression,
+                })
+            }
+            None => None,
+        };
+
+        println!("metadata: {:?}", metadata);
 
         Ok(Box::new(Aedat4Decoder {
             offset: iohe_root.data_table_offset(),
             current_timestamp: 0,
             current_frame: 1,
             buffered_reader,
-            metadata: None, // TODO: extract metadata from xml in iohe_root
+            metadata: metadata,
         }))
     }
 }
@@ -116,32 +205,99 @@ struct Aedat4Decoder {
     metadata: Option<VideoMetadata>,
 }
 
+trait Aedat4DecoderExt {
+    fn decompress(&self, compression: CompressionType, data: &[u8])
+    -> Result<Vec<u8>, DecodeError>;
+}
+
+impl Aedat4DecoderExt for Aedat4Decoder {
+    fn decompress(
+        &self,
+        compression: CompressionType,
+        data: &[u8],
+    ) -> Result<Vec<u8>, DecodeError> {
+        match compression {
+            CompressionType::NONE => Ok(data.to_vec()),
+            CompressionType::LZ4 => {
+                let mut decoder =
+                    lz4::Decoder::new(Cursor::new(data)).expect("decoder failed to init");
+                let mut decompressed = Vec::new();
+                decoder
+                    .read_to_end(&mut decompressed)
+                    .map_err(|e| DecodeError::UnexpectedError(ErrorKind::Other, e.to_string()))?;
+
+                Ok(decompressed)
+            }
+            _ => unimplemented!("unsupported compression type: {:?}", compression),
+        }
+    }
+}
+
 #[async_trait]
 impl Decoder for Aedat4Decoder {
     fn metadata(&self) -> &VideoMetadata {
         self.metadata.as_ref().unwrap()
     }
 
-    async fn next_frame(&mut self) -> Result<Option<Frame>, DecodeError> {
-        // parse packet header, this is exactly 8 bytes
+    async fn next_packet(&mut self) -> Result<Option<Packet>, DecodeError> {
+        // parse packet header, this is exactly 8 bytes: https://docs.inivation.com/software/software-advanced-usage/file-formats/aedat-4.0.html
+
         let mut header_buffer = [0u8; 8];
         self.buffered_reader
             .read_exact(&mut header_buffer)
             .await
             .map_err(|e| DecodeError::UnexpectedError(ErrorKind::Other, e.to_string()))?;
 
-        println!("saw header: {:?}", header_buffer.to_ascii_lowercase());
+        let header = aedat4_data_generated::PacketHeader(header_buffer);
 
-        let header =
-            aedat4_data_generated::root_as_packet(&mut header_buffer).expect("header not found");
+        print!(
+            "[decode] packet #{:?}, compressed size: {} bytes, ",
+            header.id(),
+            header.size()
+        );
 
-        println!("{:?}", header);
-        Ok(None)
+        let mut packet_buffer = vec![0u8; header.size() as usize];
+        self.buffered_reader
+            .read_exact(&mut packet_buffer)
+            .await
+            .map_err(|e| DecodeError::UnexpectedError(ErrorKind::Other, e.to_string()))?;
+
+        let compresssion = self.metadata.clone().expect("expected metadata, should not be here").compression;
+
+
+
+        let decompressed_buffer = self.decompress(
+            compresssion,
+            &packet_buffer,
+        )?;
+
+        let identifier = String::from_utf8_lossy(&decompressed_buffer[8..12]).to_string();
+
+        let packet_content = PacketContent {
+            id: header.id(),
+            buffer: decompressed_buffer,
+        };
+
+        // Validate the identifier and map it to the appropriate packet type.
+        let packet = match identifier.as_str() {
+            "EVTS" => Packet::EventPacket(packet_content),
+            "FRME" => Packet::FramePacket(packet_content),
+            "IMUS" => Packet::ImuPacket(packet_content),
+            "TRIG" => Packet::TriggerPacket(packet_content),
+            _ => {
+                return Err(DecodeError::UnexpectedError(
+                    ErrorKind::Other,
+                    format!("unknown identifier: {}", identifier),
+                ));
+            }
+        };
+
+        Ok(Some(packet))
     }
 
-    async fn all_frames(&mut self) -> Result<Vec<Frame>, DecodeError> {
+    async fn all_frames(&mut self) -> Result<Vec<Packet>, DecodeError> {
         let mut frames = Vec::new();
-        while let Some(frame) = self.next_frame().await? {
+        while let Some(frame) = self.next_packet().await? {
             frames.push(frame);
         }
         Ok(frames)
